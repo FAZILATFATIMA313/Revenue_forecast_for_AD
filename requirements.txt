@@ -1,0 +1,37 @@
+# requirements.txt
+# Core data processing
+pandas==2.2.2
+numpy==1.26.4
+pyarrow==16.1.0
+
+# Machine learning
+scikit-learn==1.5.1
+lightgbm==4.5.0
+
+# Model serialization
+joblib==1.4.2
+
+# Visualization (for demo app)
+matplotlib==3.9.1
+seaborn==0.13.2
+plotly==5.22.0
+
+# UI (Streamlit for demo only)
+streamlit==1.36.0
+
+# SHAP for model interpretation
+shap==0.45.0
+
+# LLM (Groq)
+groq==0.9.0
+
+# Date handling
+python-dateutil==2.9.0
+
+# Progress bars 
+tqdm==4.66.4
+
+# Configuration management
+python-dotenv==1.0.1
+
+holidays==0.27.1
