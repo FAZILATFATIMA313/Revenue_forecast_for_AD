@@ -10,3 +10,5 @@ streamlit>=1.28.0
 plotly>=5.17.0
 groq>=0.9.0
 python-dotenv>=1.0.0
+holidays==0.38
+holidays>=0.38
