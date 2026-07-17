@@ -17,8 +17,12 @@ echo "Model path:     $MODEL_PATH"
 echo "Output path:    $OUTPUT_PATH"
 echo "========================================"
 
-# Resolve Python executable (make run.sh robust across environments)
-if command -v python >/dev/null 2>&1; then
+# Resolve Python executable (prefer .venv, then python, then python3)
+if [ -f ".venv/bin/python" ]; then
+  PYTHON_BIN=".venv/bin/python"
+elif [ -f ".venv/Scripts/python.exe" ]; then
+  PYTHON_BIN=".venv/Scripts/python.exe"
+elif command -v python >/dev/null 2>&1; then
   PYTHON_BIN="python"
 elif command -v python3 >/dev/null 2>&1; then
   PYTHON_BIN="python3"
@@ -30,17 +34,21 @@ fi
 # Step 1: Generate features from input data
 echo ""
 echo "Step 1/2: Generating features..."
+FEATURES_PATH="features.csv"
 "$PYTHON_BIN" src/generate_features.py \
     --data-dir "$DATA_DIR" \
-    --out features.parquet
+    --out "$FEATURES_PATH"
 
 # Step 2: Load model and produce predictions
+# Pass --data-dir explicitly so predict.py can find historical CSVs for bootstrap/OOD.
+# This arg is forwarded through the features CSV's directory context.
 echo ""
 echo "Step 2/2: Generating predictions..."
 "$PYTHON_BIN" src/predict.py \
-    --features features.parquet \
+    --features "$FEATURES_PATH" \
     --model "$MODEL_PATH" \
-    --output "$OUTPUT_PATH"
+    --output "$OUTPUT_PATH" \
+    --data-dir "$DATA_DIR"
 
 echo ""
 echo "========================================"

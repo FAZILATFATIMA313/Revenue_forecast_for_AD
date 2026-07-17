@@ -52,6 +52,7 @@ class ForecastingValidator:
             '5_edge_cases': self.validate_edge_cases(df),
             '6_prediction_consistency': self.validate_prediction_consistency(df),
             '7_real_scenario_simulation': self.simulate_real_scenario(df),
+            '8_reconciliation_calibration': self.validate_reconciliation_calibration(df),
         }
         
         self.results = validations
@@ -450,6 +451,112 @@ class ForecastingValidator:
     # TEST 6: PREDICTION CONSISTENCY
     # ================================================================
     
+    def validate_reconciliation_calibration(self, df: pd.DataFrame) -> dict:
+        """
+        Compare legacy independent blended-total intervals vs reconciled (bootstrap) intervals.
+
+        Returns a dict consumable by Streamlit:
+          {
+            'passed': bool,
+            'details': str,
+            'results': {
+              'coverage': {'legacy_p10_p90': float, 'reconciled_p10_p90': float},
+              'pinball_loss': {
+                 'legacy': {'p10': float,'p50': float,'p90': float},
+                 'reconciled': {'p10': float,'p50': float,'p90': float},
+              },
+              'n_samples': {'legacy': int,'reconciled': int}
+            }
+          }
+        """
+        logger.info(f"\n{'-'*60}")
+        logger.info("?? TEST 8: Reconciliation Calibration (coverage + pinball loss)")
+        logger.info(f"{'-'*60}")
+
+        # Fallback: if FeatureEngineer or reconciliation helper is missing, don't crash the demo.
+        try:
+            engineer = FeatureEngineer(periods=[30, 60, 90])
+            features = engineer.create_training_data(df)
+
+            test_periods = features[features['ref_date'] >= features['ref_date'].max() - timedelta(days=180)].copy()
+            if test_periods.empty or 'target_total_revenue' not in test_periods.columns:
+                return {'passed': False, 'details': 'Insufficient test data or missing target_total_revenue', 'results': {}}
+
+            # Evaluate using existing legacy quantile heads and reconciled bootstrap from src.predict
+            from src.predict import _bootstrap_reconciled_blended_quantiles
+
+            legacy_p10_p90_cov = []
+            recon_p10_p90_cov = []
+            pinball_legacy = {'p10': [], 'p50': [], 'p90': []}
+            pinball_recon = {'p10': [], 'p50': [], 'p90': []}
+
+            for _, r in test_periods.iterrows():
+                period_days = int(r['period_days'])
+                y = float(r['target_total_revenue'])
+                if np.isnan(y):
+                    continue
+
+                X_row = pd.DataFrame([{c: r.get(c, 0) for c in self.model.feature_names}]).replace([np.inf, -np.inf], np.nan).fillna(0)
+                X_scaled = self.model.scaler.transform(X_row)
+                X_scaled_df = pd.DataFrame(X_scaled, columns=self.model.feature_names)
+
+                # Legacy quantiles
+                if all(k in self.model.models for k in ['target_total_revenue_q10', 'target_total_revenue_q50', 'target_total_revenue_q90']):
+                    p10 = float(self.model.models['target_total_revenue_q10'].predict(X_scaled_df)[0])
+                    p50 = float(self.model.models['target_total_revenue_q50'].predict(X_scaled_df)[0])
+                    p90 = float(self.model.models['target_total_revenue_q90'].predict(X_scaled_df)[0])
+                    p10 = max(0.0, p10); p50 = max(0.0, p50); p90 = max(0.0, p90)
+                    legacy_p10_p90_cov.append(1.0 if (y >= p10 and y <= p90) else 0.0)
+
+                    for q_label, alpha in [('p10', 0.10), ('p50', 0.50), ('p90', 0.90)]:
+                        pred = {'p10': p10, 'p50': p50, 'p90': p90}[q_label]
+                        err = y - pred
+                        pin = np.mean(np.where(err >= 0, alpha * err, (alpha - 1) * err))
+                        pinball_legacy[q_label].append(float(pin))
+
+                # Reconciled quantiles
+                # Uses df as historical source for residual bootstrap inside helper.
+                rec = _bootstrap_reconciled_blended_quantiles(
+                    df_hist=df,
+                    model=self.model,
+                    feature_cols=self.model.feature_names,
+                    request_row_scaled=X_scaled_df,
+                    period_days=period_days,
+                    n_boot=120,
+                    quantiles=(0.10, 0.50, 0.90),
+                )
+                rp10 = max(0.0, float(rec['revenue_p10']))
+                rp50 = max(0.0, float(rec['revenue_p50']))
+                rp90 = max(0.0, float(rec['revenue_p90']))
+
+                recon_p10_p90_cov.append(1.0 if (y >= rp10 and y <= rp90) else 0.0)
+
+                for q_label, alpha in [('p10', 0.10), ('p50', 0.50), ('p90', 0.90)]:
+                    pred = {'p10': rp10, 'p50': rp50, 'p90': rp90}[q_label]
+                    err = y - pred
+                    pin = np.mean(np.where(err >= 0, alpha * err, (alpha - 1) * err))
+                    pinball_recon[q_label].append(float(pin))
+
+            def _avg(lst):
+                return float(np.mean(lst)) if lst else float('nan')
+
+            legacy_cov = _avg(legacy_p10_p90_cov)
+            recon_cov = _avg(recon_p10_p90_cov)
+
+            return {
+                'passed': True if not np.isnan(recon_cov) else False,
+                'details': 'Compared legacy vs reconciled using empirical coverage and pinball loss',
+                'results': {
+                    'coverage': {'legacy_p10_p90': legacy_cov, 'reconciled_p10_p90': recon_cov},
+                    'pinball_loss': {'legacy': {k: _avg(v) for k, v in pinball_legacy.items()},
+                                       'reconciled': {k: _avg(v) for k, v in pinball_recon.items()}},
+                    'n_samples': {'legacy': len(legacy_p10_p90_cov), 'reconciled': len(recon_p10_p90_cov)},
+                }
+            }
+        except Exception as e:
+            logger.warning(f"Reconciliation calibration failed: {e}")
+            return {'passed': False, 'details': f'Reconciliation calibration failed: {e}', 'results': {}}
+
     def validate_prediction_consistency(self, df: pd.DataFrame) -> dict:
         """Check that predictions are internally consistent."""
         logger.info(f"\n{'-'*60}")

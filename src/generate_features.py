@@ -220,7 +220,10 @@ def generate_features(data_dir: str, output_path: str):
         for q in range(1, 5):
             row[f'is_q{q}'] = 1 if ref_date.quarter == q else 0
         
-        row['is_holiday'] = 0  # Simplified
+        # Seasonality indicator (match training logic)
+        # Training uses `SHOPPING_EVENTS` membership on `ref_date`
+        from src.features import SHOPPING_EVENTS
+        row['is_holiday'] = 1 if ref_date.strftime('%Y-%m-%d') in SHOPPING_EVENTS else 0
         row['weekend_ratio'] = 2/7
         
         min_date = daily_pivot['date'].min()
@@ -230,26 +233,13 @@ def generate_features(data_dir: str, output_path: str):
         # src/generate_features.py - Replace the campaign type section (around line 180-195)
 # Find this block in generate_features() and replace with:
 
-        # Campaign type features - MATCH TRAINING NAMING
-        # Normalize campaign type names to match training
-        type_mapping = {
-            'SEARCH': 'search',
-            'Search': 'search',
-            'PERFORMANCE_MAX': 'pmax',
-            'PerformanceMax': 'pmax',
-            'DISPLAY': 'display',
-            'Display': 'display',
-            'VIDEO': 'video',
-            'Video': 'video',
-            'DEMAND_GEN': 'demand_gen',
-            'SHOPPING': 'shopping',
-            'Shopping': 'shopping',
-            'Audience': 'audience',
-            'unknown': 'other',
-        }
+        # Campaign type features - use SHARED mapping from config (same as training)
+        # Also emit zero-filled columns for ALL known ctype buckets so the model never
+        # sees missing features for any type, even if it had zero rows in the window.
+        from src.config import CAMPAIGN_TYPE_MAPPING, KNOWN_CTYPE_BUCKETS
         
         df_normalized = df.copy()
-        df_normalized['campaign_type_normalized'] = df_normalized['campaign_type'].map(type_mapping).fillna('other')
+        df_normalized['campaign_type_normalized'] = df_normalized['campaign_type'].map(CAMPAIGN_TYPE_MAPPING).fillna('other')
         
         ctype_data = df_normalized.groupby(['date', 'campaign_type_normalized']).agg({
             'spend': 'sum', 'revenue': 'sum'
@@ -258,12 +248,18 @@ def generate_features(data_dir: str, output_path: str):
         ctype_mask = (ctype_data['date'] >= feature_start) & (ctype_data['date'] <= feature_end)
         ctype_window = ctype_data[ctype_mask]
         
+        # Initialize ALL known ctype buckets to 0 (prevents silent feature-name drift)
+        for ctype in KNOWN_CTYPE_BUCKETS:
+            row[f'feature_spend_ctype_{ctype}'] = 0.0
+            row[f'feature_revenue_ctype_{ctype}'] = 0.0
+            row[f'feature_roas_ctype_{ctype}'] = 0.0
+        # Override with actual data where available
         for ctype in ctype_window['campaign_type_normalized'].unique():
             ctype_spend = ctype_window[ctype_window['campaign_type_normalized'] == ctype]['spend'].sum()
             ctype_rev = ctype_window[ctype_window['campaign_type_normalized'] == ctype]['revenue'].sum()
             row[f'feature_spend_ctype_{ctype}'] = ctype_spend
             row[f'feature_revenue_ctype_{ctype}'] = ctype_rev
-            row[f'feature_roas_ctype_{ctype}'] = ctype_rev / ctype_spend if ctype_spend > 0 else 0
+            row[f'feature_roas_ctype_{ctype}'] = ctype_rev / ctype_spend if ctype_spend > 0 else 0.0
         all_features.append(row)
     
     # Create DataFrame
@@ -273,7 +269,20 @@ def generate_features(data_dir: str, output_path: str):
     features_df = features_df.fillna(0)
     
     # Save
-    features_df.to_parquet(output_path, index=False)
+    try:
+        if str(output_path).endswith(".parquet"):
+            features_df.to_parquet(output_path, index=False)
+        else:
+            features_df.to_csv(output_path, index=False)
+    except ImportError as e:
+        # Parquet engine missing (e.g., pyarrow). Fallback to CSV for scoring.
+        if str(output_path).endswith(".parquet"):
+            csv_out = str(output_path).replace(".parquet", ".csv")
+            features_df.to_csv(csv_out, index=False)
+            output_path = csv_out
+        else:
+            raise e
+
     logger.info(f"\n? Features saved to {output_path}")
     logger.info(f"   Shape: {features_df.shape}")
     logger.info(f"   Requests: {features_df['request_id'].tolist()}")
@@ -288,4 +297,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     generate_features(args.data_dir, args.out)
-

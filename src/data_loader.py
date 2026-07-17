@@ -217,6 +217,183 @@ def validate_and_clean(df: pd.DataFrame) -> pd.DataFrame:
     return df[STANDARD_COLS]
 
 
+def validate_campaign_consistency(df: pd.DataFrame) -> Dict:
+    """
+    Explicit campaign consistency validation for ingestion requirement.
+
+    Checks:
+      - Campaigns with inconsistent naming/type across dates
+      - Campaigns with sudden platform reassignment
+      - Missing campaign_id/campaign_type values
+      - Date-range gaps per campaign (per platform)
+    """
+    logger.info(f"\n{'='*60}")
+    logger.info("?? CAMPAIGN CONSISTENCY VALIDATION")
+    logger.info(f"{'='*60}")
+
+    required_cols = ['date', 'campaign_id', 'campaign_name', 'campaign_type', 'platform']
+    missing_required = [c for c in required_cols if c not in df.columns]
+    if missing_required:
+        msg = f"Missing required columns for consistency validation: {missing_required}"
+        logger.error(f"? {msg}")
+        return {
+            'passed': False,
+            'checks': {},
+            'summary': {'error': msg}
+        }
+
+    # Defensive normalization for comparisons
+    work = df.copy()
+    work['campaign_id'] = work['campaign_id'].astype(str)
+    work['campaign_name'] = work['campaign_name'].astype(str)
+    work['campaign_type'] = work['campaign_type'].astype(str)
+    work['platform'] = work['platform'].astype(str).str.strip().str.lower()
+
+    # Consider empty strings / None-like as missing
+    def _is_missing_str(s: pd.Series) -> pd.Series:
+        s2 = s.astype(str)
+        s2 = s2.replace({'none': np.nan, 'nan': np.nan, 'null': np.nan})
+        return s2.isna() | (s2.astype(str).str.strip() == '') | (s2.astype(str).str.strip().str.lower() == 'unknown')
+
+    missing_campaign_id = _is_missing_str(work['campaign_id']).sum()
+    missing_campaign_type = _is_missing_str(work['campaign_type']).sum()
+
+    # Inconsistent naming/type across dates (per platform + campaign_id)
+    grp = work.groupby(['platform', 'campaign_id'])
+    inconsistent_name = []
+    inconsistent_type = []
+    for (platform, campaign_id), g in grp:
+        names = sorted({str(x) for x in g['campaign_name'].unique() if str(x).strip() != ''})
+        types = sorted({str(x) for x in g['campaign_type'].unique() if str(x).strip() != ''})
+        if len(names) > 1:
+            inconsistent_name.append({
+                'platform': platform,
+                'campaign_id': campaign_id,
+                'campaign_name_variants': names[:5],
+                'num_variants': len(names),
+            })
+        if len(types) > 1:
+            inconsistent_type.append({
+                'platform': platform,
+                'campaign_id': campaign_id,
+                'campaign_type_variants': types[:5],
+                'num_variants': len(types),
+            })
+
+    # Sudden platform reassignment (per campaign_id across time)
+    platform_segments = []
+    for campaign_id, g in work.sort_values('date').groupby('campaign_id'):
+        platforms = g['platform'].tolist()
+        # Count transitions
+        transitions = [0]
+        for i in range(1, len(platforms)):
+            transitions.append(1 if platforms[i] != platforms[i-1] else 0)
+        num_transitions = int(sum(transitions))
+        distinct_platforms = sorted(set(platforms))
+        # Flag if campaign_id appears on more than one platform at any point
+        if len(distinct_platforms) > 1:
+            # Also compute contiguous segments count
+            segment_count = 1
+            for i in range(1, len(platforms)):
+                if platforms[i] != platforms[i-1]:
+                    segment_count += 1
+            platform_segments.append({
+                'campaign_id': campaign_id,
+                'platforms_seen': distinct_platforms,
+                'segment_count': segment_count,
+                'date_start': g['date'].min().date(),
+                'date_end': g['date'].max().date(),
+            })
+
+    # Date gaps per campaign (per platform, daily gaps between min..max)
+    gap_rows = []
+    # Reduce work: operate at per-day presence level
+    presence = work[['platform', 'campaign_id', 'date']].drop_duplicates()
+    for (platform, campaign_id), g in presence.groupby(['platform', 'campaign_id']):
+        g = g.sort_values('date')
+        min_d = g['date'].min()
+        max_d = g['date'].max()
+        if pd.isna(min_d) or pd.isna(max_d):
+            continue
+        # Build expected day index
+        expected_days = pd.date_range(min_d, max_d, freq='D')
+        actual_days = set(g['date'].dt.normalize().tolist())
+        missing_days = [d for d in expected_days.normalize().tolist() if d not in actual_days]
+        if len(missing_days) > 0:
+            # Collapse into ranges for compact reporting
+            missing_days_sorted = sorted(missing_days)
+            ranges = []
+            start = missing_days_sorted[0]
+            prev = start
+            for d in missing_days_sorted[1:]:
+                if (d - prev).days == 1:
+                    prev = d
+                    continue
+                ranges.append((start.date(), prev.date()))
+                start = d
+                prev = d
+            ranges.append((start.date(), prev.date()))
+            gap_rows.append({
+                'platform': platform,
+                'campaign_id': campaign_id,
+                'missing_day_count': int(len(missing_days)),
+                'gap_ranges': [(str(a), str(b)) for a, b in ranges[:5]],
+                'date_start': min_d.date(),
+                'date_end': max_d.date(),
+            })
+
+    # Assemble report
+    checks = {
+        'missing_campaign_values': {
+            'passed': (missing_campaign_id == 0) and (missing_campaign_type == 0),
+            'details': f"Missing campaign_id rows: {int(missing_campaign_id)}, missing campaign_type rows: {int(missing_campaign_type)}",
+            'examples': []
+        },
+        'inconsistent_campaign_name_across_dates': {
+            'passed': len(inconsistent_name) == 0,
+            'details': f"Inconsistent name variants found in {len(inconsistent_name)} (platform,campaign_id) groups",
+            'examples': inconsistent_name[:10],
+        },
+        'inconsistent_campaign_type_across_dates': {
+            'passed': len(inconsistent_type) == 0,
+            'details': f"Inconsistent campaign_type variants found in {len(inconsistent_type)} (platform,campaign_id) groups",
+            'examples': inconsistent_type[:10],
+        },
+        'sudden_platform_reassignment': {
+            'passed': len(platform_segments) == 0,
+            'details': f"Campaign IDs reassigned across platforms: {len(platform_segments)}",
+            'examples': platform_segments[:10],
+        },
+        'date_range_gaps_per_campaign': {
+            'passed': len(gap_rows) == 0,
+            'details': f"Campaigns with daily date gaps (per platform): {len(gap_rows)}",
+            'examples': gap_rows[:10],
+        },
+    }
+
+    passed = all(v.get('passed', False) for v in checks.values())
+    summary = {
+        'passed': passed,
+        'missing_campaign_id_rows': int(missing_campaign_id),
+        'missing_campaign_type_rows': int(missing_campaign_type),
+        'inconsistent_name_groups': len(inconsistent_name),
+        'inconsistent_type_groups': len(inconsistent_type),
+        'platform_reassignment_campaign_ids': len(platform_segments),
+        'campaigns_with_date_gaps': len(gap_rows),
+    }
+
+    # Human-readable logging
+    passed_count = sum(1 for v in checks.values() if v.get('passed'))
+    total_checks = len(checks)
+    logger.info(f"   Results: {passed_count}/{total_checks} checks passed")
+    for name, result in checks.items():
+        icon = "?" if result['passed'] else "!"
+        logger.info(f"   {icon} {name}: {result.get('details','')}")
+    logger.info(f"{'='*60}\n")
+
+    return {'passed': passed, 'summary': summary, 'checks': checks}
+
+
 def load_single_file(filepath: str) -> Tuple[Optional[pd.DataFrame], str]:
     """
     Load and normalize a single CSV file.
@@ -307,7 +484,13 @@ def load_all_data(data_dir: str = None) -> pd.DataFrame:
     after = len(combined)
     if before > after:
         logger.info(f"Removed {before - after} cross-file duplicates")
-    
+
+    # Explicit ingestion requirement: campaign consistency validation
+    try:
+        _ = validate_campaign_consistency(combined)
+    except Exception as e:
+        logger.error(f"? Campaign consistency validation failed: {e}")
+
     # Print summary
     logger.info(f"\n{'='*60}")
     logger.info(f"?? DATA LOADING SUMMARY")

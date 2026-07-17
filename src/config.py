@@ -1,13 +1,13 @@
 # src/config.py
 import os
-from dotenv import load_dotenv
 from pathlib import Path
 
+# dotenv is optional: make sure importing config never fails during scoring
 try:
-    from dotenv import load_dotenv
+    from dotenv import load_dotenv  # type: ignore
     load_dotenv()
 except ImportError:
-    pass  # dotenv not required for pipeline
+    load_dotenv = None  # noqa: F401
 
 # Project paths
 ROOT_DIR = Path(__file__).parent.parent
@@ -49,3 +49,25 @@ ANOMALY_WINDOW_DAYS = 30
 # Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
+# Shared campaign-type normalization mapping (training + inference MUST use the same set)
+# Ensures feature-name consistency between src/features.py and src/generate_features.py.
+CAMPAIGN_TYPE_MAPPING = {
+    'SEARCH': 'search',
+    'Search': 'search',
+    'PERFORMANCE_MAX': 'pmax',
+    'PerformanceMax': 'pmax',
+    'DISPLAY': 'display',
+    'Display': 'display',
+    'VIDEO': 'video',
+    'Video': 'video',
+    'DEMAND_GEN': 'demand_gen',
+    'SHOPPING': 'shopping',
+    'Shopping': 'shopping',
+    'Audience': 'audience',
+    'unknown': 'other',
+    '': 'other',
+}
+
+# All known normalized ctype buckets — used by generate_features.py to emit zero-filled columns
+# even when a type has no rows in the feature window, preventing silent feature-name drift.
+KNOWN_CTYPE_BUCKETS = ['search', 'pmax', 'display', 'video', 'demand_gen', 'shopping', 'audience', 'other']

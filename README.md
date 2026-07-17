@@ -106,7 +106,7 @@ A Streamlit dashboard is included for interactive demos.
 ### Start the App
 
 ```bash
-streamlit run src/app.py
+streamlit run app.py
 ```
 
 ### What the App Provides

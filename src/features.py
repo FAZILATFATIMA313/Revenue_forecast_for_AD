@@ -20,17 +20,24 @@ from datetime import datetime, timedelta
 
 from pathlib import Path
 
-import holidays
+# holidays is optional for runtime scoring; make import safe
+try:
+    import holidays  # type: ignore
+except ImportError:  # pragma: no cover
+    holidays = None
 
 from src.logger import setup_logger
 
-from src.config import DEFAULT_PERIODS, RANDOM_SEED
+from src.config import DEFAULT_PERIODS, RANDOM_SEED, CAMPAIGN_TYPE_MAPPING
 
 logger = setup_logger(__name__)
 
 # Indian holidays (add more as needed)
-
-INDIAN_HOLIDAYS = holidays.India(years=[2024, 2025, 2026])
+# If `holidays` isn't installed, default to empty set so feature creation doesn't fail.
+if holidays is not None:
+    INDIAN_HOLIDAYS = holidays.India(years=[2024, 2025, 2026])
+else:
+    INDIAN_HOLIDAYS = set()
 
 # Global shopping events
 
@@ -474,43 +481,17 @@ class FeatureEngineer:
 
         Matches campaign types across platforms (SEARCH, PERFORMANCE_MAX, etc.)
 
+        Uses the shared CAMPAIGN_TYPE_MAPPING from config.py to ensure
+
+        training and inference produce the exact same feature names.
+
         """
 
         logger.info("\n?? Creating campaign-type features...")
 
-        # Normalize campaign types
-
-        type_mapping = {
-
-            'SEARCH': 'search',
-
-            'Search': 'search',
-
-            'PERFORMANCE_MAX': 'pmax',
-
-            'PerformanceMax': 'pmax',
-
-            'DISPLAY': 'display',
-
-            'Display': 'display',
-
-            'VIDEO': 'video',
-
-            'Video': 'video',
-
-            'DEMAND_GEN': 'demand_gen',
-
-            'SHOPPING': 'shopping',
-
-            'Shopping': 'shopping',
-
-            'Audience': 'audience',
-
-        }
-
         df = df.copy()
 
-        df['campaign_type_normalized'] = df['campaign_type'].map(type_mapping).fillna('other')
+        df['campaign_type_normalized'] = df['campaign_type'].map(CAMPAIGN_TYPE_MAPPING).fillna('other')
 
         # Aggregate by date and normalized campaign type
 
@@ -992,4 +973,3 @@ if __name__ == "__main__":
     for i, col in enumerate(target_cols, 1):
 
         print(f"  {i:3d}. {col}")
-

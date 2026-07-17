@@ -18,10 +18,11 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.anomaly_detector import AnomalyDetector
+from src.causal_layer import generate_causal_outputs
 from src.config import GROQ_API_KEY, GROQ_MODEL, PICKLE_DIR
 from src.data_loader import load_all_data
 from src.logger import setup_logger
-from src.predict import predict
+from src.predict import predict, compute_ood_flags
 from src.train import ForecastingModel
 
 # Optional: Groq for LLM insights
@@ -72,11 +73,21 @@ st.markdown(
         color: #000 !important;
         -webkit-text-fill-color: #000 !important;
     }
+
+    .ood-badge {
+        display: inline-block;
+        background: #fff3cd;
+        color: #856404;
+        border: 1px solid #ffc107;
+        border-radius: 4px;
+        padding: 2px 8px;
+        font-size: 12px;
+        font-weight: 600;
+        margin-left: 6px;
+        vertical-align: middle;
+    }
     
     /* ===== TAB FONT SIZE ===== */
-    /* [data-baseweb="tab"] IS the button element itself - target it directly,
-       not "button[data-baseweb='tab']" or "[role='tablist'] button" which
-       don't reliably match current Streamlit markup. */
     .stTabs [data-baseweb="tab-list"] {
         gap: 8px;
     }
@@ -92,23 +103,14 @@ st.markdown(
         font-weight: 600 !important;
         white-space: nowrap !important;
     }
-
-    /* NOTE: Plotly chart font sizes are intentionally NOT set here.
-       Plotly renders text as SVG and computes layout (margins, tick
-       spacing, legend box size) from the font size given in the Python
-       layout config. CSS overrides only resize the glyphs visually and
-       get reverted on any redraw (zoom, resize, tab switch). Chart fonts
-       are now set via style_chart() below instead - see chart calls. */
 </style>
 """,
     unsafe_allow_html=True,
 )
-def style_chart(fig, title_size: int = 20, axis_size: int = 16, legend_size: int = 16, base_size: int = 14):
-    """Apply consistent font sizing to a Plotly figure via its layout config.
 
-    This is the reliable way to size Plotly text - CSS can't do it because
-    Plotly computes layout (margins, tick spacing) from these values itself.
-    """
+
+def style_chart(fig, title_size: int = 20, axis_size: int = 16, legend_size: int = 16, base_size: int = 14):
+    """Apply consistent font sizing to a Plotly figure via its layout config."""
     fig.update_layout(
         font=dict(size=base_size),
         title_font=dict(size=title_size, family="Arial, sans-serif"),
@@ -117,6 +119,13 @@ def style_chart(fig, title_size: int = 20, axis_size: int = 16, legend_size: int
     fig.update_xaxes(tickfont=dict(size=axis_size))
     fig.update_yaxes(tickfont=dict(size=axis_size))
     return fig
+
+
+def fmt_float(val: float, decimals: int = 2) -> str:
+    """Round a float to a fixed number of decimal places, returning a string."""
+    if val == 0 or val != val:  # catches NaN
+        return "0" if decimals == 0 else f"0.{'0'*decimals}"
+    return f"{val:.{decimals}f}"
 
 
 # ============================================================
@@ -129,12 +138,43 @@ def load_data_cached() -> pd.DataFrame:
     return load_all_data()
 
 
+@st.cache_data(ttl=3600)
+def campaign_consistency_report_cached() -> dict:
+    """
+    Explicit ingestion requirement:
+    make campaign consistency validation visible + demoable.
+    """
+    from src.data_loader import validate_campaign_consistency
+
+    df = load_data_cached()
+    return validate_campaign_consistency(df)
+
+
 @st.cache_resource
 def load_model_cached() -> ForecastingModel | None:
     model_path = PICKLE_DIR / "model.pkl"
     if model_path.exists():
         return ForecastingModel.load(str(model_path))
     return None
+
+
+@st.cache_data(ttl=3600)
+def get_validation_results_cached() -> dict:
+    """Run validation suite and cache results for Methodology tab."""
+    try:
+        from src.validate import ForecastingValidator
+
+        df = load_data_cached()
+        model = load_model_cached()
+        if model is None:
+            return {"error": "Model not trained"}
+        validator = ForecastingValidator()
+        # Override model with loaded instance
+        validator.model = model
+        results = validator.run_all_validations(df)
+        return results
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ============================================================
@@ -168,6 +208,19 @@ with st.sidebar:
     except Exception:
         default_google, default_meta, default_ms = 50000, 10000, 5000
 
+    # Pre-compute historical daily spend percentiles for OOD hints
+    ood_hints = {"google": "", "meta": "", "ms": ""}
+    try:
+        df_all = load_data_cached()
+        for plat_norm, plat_key in [("google", "google"), ("meta", "meta"), ("microsoft", "ms")]:
+            plat_daily = df_all[df_all["platform"] == plat_norm].groupby("date")["spend"].sum().dropna()
+            if len(plat_daily) >= 10:
+                p5 = float(np.percentile(plat_daily.values, 5))
+                p95 = float(np.percentile(plat_daily.values, 95))
+                ood_hints[plat_key] = f"Typical daily range: ${p5:,.0f}-${p95:,.0f}"
+    except Exception:
+        pass
+
     google_budget = st.number_input(
         "Google Ads Budget ($)",
 
@@ -175,6 +228,7 @@ with st.sidebar:
         value=int(default_google),
         step=5000,
         format="%d",
+        help=ood_hints["google"],
     )
     meta_budget = st.number_input(
         "Meta Ads Budget ($)",
@@ -182,6 +236,7 @@ with st.sidebar:
         value=int(default_meta),
         step=5000,
         format="%d",
+        help=ood_hints["meta"],
     )
     ms_budget = st.number_input(
         "Microsoft Ads Budget ($)",
@@ -189,6 +244,7 @@ with st.sidebar:
         value=int(default_ms),
         step=1000,
         format="%d",
+        help=ood_hints["ms"],
     )
 
     total_budget = google_budget + meta_budget + ms_budget
@@ -211,10 +267,15 @@ with st.sidebar:
 
     st.markdown("---")
 
+    # Disable forecast button when total budget is zero — prevents pointless 2-minute wait
+    budget_too_low = total_budget <= 0
+    if budget_too_low:
+        st.warning("Enter a budget above $0 to run a forecast.")
+
     forecast_button = st.button(
         "Generate Forecast",
         type="primary",
-        width='stretch'  ,
+        disabled=budget_too_low,
     )
 
     enable_llm = st.checkbox("Enable AI Insights (Groq)", value=True)
@@ -237,74 +298,98 @@ st.markdown("---")
 
 with tab1:
     if forecast_button:
-        st.spinner("Generating probabilistic forecast...")
-
         model = load_model_cached()
         if model is None:
             st.error("Model not found! Run `python src/train.py` first.")
             st.stop()
 
+        # Multi-stage status display — shows progress during the 2-3 minute forecast
+        status_placeholder = st.empty()
+
         # Prepare temp request data + feature generation
-        from src.generate_features import generate_features  # local import to keep app startup fast
+        from src.generate_features import generate_features
 
         tmp_dir = tempfile.mkdtemp()
-        try:
-            # Create request CSV in temp dir (generate_features expects a CSV)
-            requests_df = pd.DataFrame(
-                [
-                    {
-                        "request_id": "streamlit_forecast",
-                        "period_days": period_days,
-                        "spend_google": google_budget,
-                        "spend_meta": meta_budget,
-                        "spend_ms": ms_budget,
+        pred = None
+        ood_flags = {}
+        campaign_alloc = pd.DataFrame()
+
+        with st.status("Generating probabilistic forecast...", expanded=True) as forecast_status:
+            forecast_status.write("Preparing data...")
+
+            try:
+                requests_df = pd.DataFrame(
+                    [
+                        {
+                            "request_id": "streamlit_forecast",
+                            "period_days": period_days,
+                            "spend_google": google_budget,
+                            "spend_meta": meta_budget,
+                            "spend_ms": ms_budget,
+                        }
+                    ]
+                )
+                requests_path = os.path.join(tmp_dir, "forecast_requests.csv")
+                requests_df.to_csv(requests_path, index=False)
+
+                # Copy data to temp
+                data_tmp = os.path.join(tmp_dir, "./data")
+                os.makedirs(data_tmp, exist_ok=True)
+
+                for f in os.listdir("./data"):
+                    if f.endswith(".csv"):
+                        import shutil
+                        shutil.copy(os.path.join("./data", f), os.path.join(data_tmp, f))
+                import shutil
+                shutil.copy(requests_path, os.path.join(data_tmp, "forecast_requests.csv"))
+
+                forecast_status.write("Generating features...")
+                features_path = os.path.join(tmp_dir, "features.parquet")
+                generate_features(data_tmp, features_path)
+
+                forecast_status.write("Running prediction model...")
+                predict(features_path, str(PICKLE_DIR / "model.pkl"), os.path.join(tmp_dir, "predictions.csv"))
+                predictions = pd.read_csv(os.path.join(tmp_dir, "predictions.csv"))
+
+                pred = predictions.iloc[0]
+
+                # OOD flags
+                forecast_status.write("Checking confidence...")
+                budgets_for_ood = {"google": float(google_budget), "meta": float(meta_budget), "ms": float(ms_budget)}
+                df_hist = load_data_cached()
+                ood_flags = compute_ood_flags(
+                    df_hist, budgets_for_ood, period_days,
+                    pred_row=pred.to_dict() if hasattr(pred, "to_dict") else dict(pred),
+                )
+
+                # Campaign-level breakdown
+                from src.predict import allocate_campaign_level_from_history
+                try:
+                    budgets = {
+                        "google": float(google_budget),
+                        "meta": float(meta_budget),
+                        "ms": float(ms_budget),
                     }
-                ]
-            )
-            requests_path = os.path.join(tmp_dir, "forecast_requests.csv")
-            requests_df.to_csv(requests_path, index=False)
+                    campaign_alloc = allocate_campaign_level_from_history(
+                        df_hist=df_hist, pred_row=pred, period_days=period_days,
+                        budgets=budgets, top_n=12, share_lookback_days=period_days,
+                    )
+                except Exception:
+                    campaign_alloc = pd.DataFrame()
 
-            # Copy data to temp
-            data_tmp = os.path.join(tmp_dir, "./data")
-            os.makedirs(data_tmp, exist_ok=True)
-          
-            for f in os.listdir("./data"):
-                if f.endswith(".csv"):
-                    import shutil
+                for prefix in ['revenue', 'google_revenue', 'meta_revenue', 'ms_revenue']:
+                    for q in ['p10', 'p50', 'p90']:
+                        col = f'{prefix}_{q}'
+                        if col in pred:
+                            pred[col] = max(0, float(pred[col]))
 
-                    shutil.copy(os.path.join("./data", f), os.path.join(data_tmp, f))
-            import shutil
+                forecast_status.write("Forecast complete!")
+                # Let status stay visible briefly, then collapse
+                import time; time.sleep(0.5)
 
-            shutil.copy(requests_path, os.path.join(data_tmp, "forecast_requests.csv"))
-
-            # Generate features + predict
-            features_path = os.path.join(tmp_dir, "features.parquet")
-            generate_features(data_tmp, features_path)
-
-            predict(features_path, str(PICKLE_DIR / "model.pkl"), os.path.join(tmp_dir, "predictions.csv"))
-            predictions = pd.read_csv(os.path.join(tmp_dir, "predictions.csv"))
-
-            pred = predictions.iloc[0]
-            MIN_REALISTIC_BUDGET = 5000
-            
-            for prefix in ['revenue', 'google_revenue', 'meta_revenue', 'ms_revenue']:
-                for q in ['p10', 'p50', 'p90']:
-                    col = f'{prefix}_{q}'
-                    if col in pred:
-                        pred[col] = max(0, float(pred[col]))
-            
-            # Clip ROAS to realistic e-commerce range (0.5x - 15x)
-            total_spend = google_budget + meta_budget + ms_budget
-            for q in ['p10', 'p50', 'p90']:
-                roas_col = f'blended_roas_{q}'
-                if roas_col in pred and total_spend > 0:
-                    raw_roas = pred[f'revenue_{q}'] / total_spend
-                    pred[roas_col] = min(max(raw_roas, 0.5), 15.0)
-                    
-        finally:
-            import shutil
-
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            finally:
+                import shutil
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
         st.success(f"Forecast generated for {period_days}-day period!")
 
@@ -340,7 +425,7 @@ with tab1:
                 base=pred["revenue_p10"],
                 name="80% Prediction Interval",
                 marker_color="rgba(102, 126, 234, 0.5)",
-                text=f"${pred['revenue_p10']:,.0f} - ${pred['revenue_p90']:,.0f}",
+                text=f"P10-P90: ${pred['revenue_p10']:,.0f} - ${pred['revenue_p90']:,.0f}",
                 textposition="inside",
             )
         )
@@ -364,34 +449,40 @@ with tab1:
         st.markdown("---")
         st.markdown("### Channel-Level Breakdown")
 
+        def _channel_header(name: str, ch_key: str) -> str:
+            flag = ood_flags.get(ch_key, {})
+            if isinstance(flag, dict) and flag.get('is_ood'):
+                return f"**{name}** <span class='ood-badge'>[!] Low confidence</span>"
+            return f"**{name}**"
+
         col_g, col_m, col_ms = st.columns(3)
         with col_g:
-            st.markdown("#### Google Ads")
+            st.markdown(f"#### {_channel_header('Google Ads', 'google')}", unsafe_allow_html=True)
             st.metric(
                 "Expected Revenue",
                 f"${pred['google_revenue_p50']:,.0f}",
-                delta=f"${pred['google_revenue_p90'] - pred['google_revenue_p10']:,.0f} range",
             )
+            st.caption(f"P10–P90 range: {pred['google_revenue_p10']:,.0f} to {pred['google_revenue_p90']:,.0f} USD")
             if google_budget > 0:
                 st.caption(f"ROAS: {pred['google_revenue_p50']/google_budget:.2f}x")
 
         with col_m:
-            st.markdown("#### Meta Ads")
+            st.markdown(f"#### {_channel_header('Meta Ads', 'meta')}", unsafe_allow_html=True)
             st.metric(
                 "Expected Revenue",
                 f"${pred['meta_revenue_p50']:,.0f}",
-                delta=f"${pred['meta_revenue_p90'] - pred['meta_revenue_p10']:,.0f} range",
             )
+            st.caption(f"P10–P90 range: {pred['meta_revenue_p10']:,.0f} to {pred['meta_revenue_p90']:,.0f} USD")
             if meta_budget > 0:
                 st.caption(f"ROAS: {pred['meta_revenue_p50']/meta_budget:.2f}x")
 
         with col_ms:
-            st.markdown("#### Microsoft Ads")
+            st.markdown(f"#### {_channel_header('Microsoft Ads', 'ms')}", unsafe_allow_html=True)
             st.metric(
                 "Expected Revenue",
                 f"${pred['ms_revenue_p50']:,.0f}",
-                delta=f"${pred['ms_revenue_p90'] - pred['ms_revenue_p10']:,.0f} range",
             )
+            st.caption(f"P10–P90 range: {pred['ms_revenue_p10']:,.0f} to {pred['ms_revenue_p90']:,.0f} USD")
             if ms_budget > 0:
                 st.caption(f"ROAS: {pred['ms_revenue_p50']/ms_budget:.2f}x")
 
@@ -433,21 +524,24 @@ with tab1:
 
         col_roas1, col_roas2 = st.columns([1, 2])
         with col_roas1:
+            # Dynamic gauge axis: scale to ~1.5x the P90 value, floor at 15
+            roas_p90 = float(pred["blended_roas_p90"])
+            gauge_max = max(15.0, roas_p90 * 1.5)
             fig_roas = go.Figure(
                 go.Indicator(
                     mode="gauge+number+delta",
                     value=float(pred["blended_roas_p50"]),
                     delta={"reference": 3.0, "increasing": {"color": "green"}},
-                    title={"text": "Expected ROAS"},
+                    title="Expected ROAS",
                     domain={"x": [0, 1], "y": [0, 1]},
                     gauge={
-                        "axis": {"range": [0, 15]},
+                        "axis": {"range": [0, gauge_max]},
                         "bar": {"color": "#667eea"},
                         "steps": [
-                            {"range": [0, 1], "color": "#ff4444"},
-                            {"range": [1, 3], "color": "#ffaa00"},
-                            {"range": [3, 6], "color": "#00cc44"},
-                            {"range": [6, 15], "color": "#00aa44"},
+                            {"range": [0, min(1, gauge_max)], "color": "#ff4444"},
+                            {"range": [min(1, gauge_max), min(3, gauge_max)], "color": "#ffaa00"},
+                            {"range": [min(3, gauge_max), min(6, gauge_max)], "color": "#00cc44"},
+                            {"range": [min(6, gauge_max), gauge_max], "color": "#00aa44"},
                         ],
                         "threshold": {
                             "line": {"color": "red", "width": 4},
@@ -458,7 +552,10 @@ with tab1:
                 )
             )
             fig_roas.update_layout(height=300)
-            st.plotly_chart(style_chart(fig_roas), width='stretch')
+            # Don't pass through style_chart — it sets title_font on figures
+            # without a layout title, which creates a phantom title with
+            # undefined text that Plotly renders as literal "undefined".
+            st.plotly_chart(fig_roas, width='stretch')
 
         with col_roas2:
             st.markdown(
@@ -478,57 +575,134 @@ with tab1:
                 unsafe_allow_html=True,
             )
 
-        # AI Insights
+        # ---- Download forecast as CSV ----
+        st.markdown("---")
+        forecast_csv = pd.DataFrame([{
+            "period_days": period_days,
+            "spend_google": pred["spend_google"],
+            "spend_meta": pred["spend_meta"],
+            "spend_ms": pred["spend_ms"],
+            "revenue_p10": pred["revenue_p10"],
+            "revenue_p50": pred["revenue_p50"],
+            "revenue_p90": pred["revenue_p90"],
+            "blended_roas_p10": pred["blended_roas_p10"],
+            "blended_roas_p50": pred["blended_roas_p50"],
+            "blended_roas_p90": pred["blended_roas_p90"],
+            "google_revenue_p10": pred["google_revenue_p10"],
+            "google_revenue_p50": pred["google_revenue_p50"],
+            "google_revenue_p90": pred["google_revenue_p90"],
+            "meta_revenue_p10": pred["meta_revenue_p10"],
+            "meta_revenue_p50": pred["meta_revenue_p50"],
+            "meta_revenue_p90": pred["meta_revenue_p90"],
+            "ms_revenue_p10": pred["ms_revenue_p10"],
+            "ms_revenue_p50": pred["ms_revenue_p50"],
+            "ms_revenue_p90": pred["ms_revenue_p90"],
+        }])
+        csv_bytes = forecast_csv.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Download this forecast as CSV",
+            data=csv_bytes,
+            file_name=f"forecast_{period_days}d.csv",
+            mime="text/csv",
+        )
+
+        # Campaign-level breakdown (if available)
+        if campaign_alloc is not None and len(campaign_alloc) > 0:
+            st.markdown("---")
+            st.markdown("### Campaign-Level Breakdown")
+
+            st.markdown("Top campaigns by channel (estimated from historical spend mix):")
+            display_cols = ["platform", "campaign_name", "campaign_type",
+                            "revenue_p50", "spend_allocated", "roas_p50"]
+            available_display = [c for c in display_cols if c in campaign_alloc.columns]
+            st.dataframe(
+                campaign_alloc[available_display].head(20).style.format({
+                    "revenue_p50": "${:,.0f}",
+                    "spend_allocated": "${:,.0f}",
+                    "roas_p50": "{:.2f}x",
+                }),
+                width='stretch',
+            )
+            st.caption("Note: Campaign-level allocation is proportional based on historical spend shares, not independently modeled.")
+
+        # AI-Assisted Causal Insights (first-class pipeline step)
         if enable_llm:
-            if GROQ_AVAILABLE and GROQ_API_KEY:
-                st.markdown("---")
-                st.markdown("### AI-Generated Insights")
+            st.markdown("---")
+            st.markdown("### AI-Assisted Causal Insights")
 
-                with st.spinner("Generating AI insights with Groq..."):
-                    try:
-                        client = Groq(api_key=GROQ_API_KEY)
-                        context = f"""
-Forecast Scenario:
-- Period: {period_days} days
-- Total Budget: ${total_budget:,.0f}
-- Google Budget: ${google_budget:,.0f}
-- Meta Budget: ${meta_budget:,.0f}
-- Microsoft Budget: ${ms_budget:,.0f}
+            try:
+                # Structured grounding signals: anomalies + model feature importances + period-over-period deltas
+                df_hist = load_data_cached()
+                detector = AnomalyDetector()
 
-Forecast Results:
-- Revenue (P10/P50/P90): ${pred['revenue_p10']:,.0f} / ${pred['revenue_p50']:,.0f} / ${pred['revenue_p90']:,.0f}
-- Blended ROAS (P10/P50/P90): {pred['blended_roas_p10']:.2f}x / {pred['blended_roas_p50']:.2f}x / {pred['blended_roas_p90']:.2f}x
-"""
+                # Scope anomaly detection to the relevant feature window + recent lookback
+                # (period_days * 2 captures the feature window + buffer)
+                scope_start = df_hist["date"].max() - timedelta(days=period_days * 3)
+                df_scoped = df_hist[df_hist["date"] >= scope_start].copy()
+                anomaly_results = detector.detect_all(df_scoped)
 
-                        response = client.chat.completions.create(
-                            model=GROQ_MODEL,
-                            messages=[
-                                {
-                                    "role": "system",
-                                    "content": "You are an expert e-commerce marketing analyst. Provide concise, actionable insights about forecast results. Keep response under 200 words.",
-                                },
-                                {
-                                    "role": "user",
-                                    "content": "Analyze this forecast and provide: (1) key insight, (2) one risk, (3) one actionable recommendation.\n\n" + context,
-                                },
-                            ],
-                            max_tokens=300,
-                            temperature=0.7,
-                        )
+                # Deterministic period-over-period deltas (budgets vs recent baseline daily spend)
+                last_30 = df_hist[df_hist["date"] >= df_hist["date"].max() - timedelta(days=30)]
+                prior_daily = {
+                    "google": float(last_30[last_30["platform"] == "google"]["spend"].sum() / 30)
+                    if len(last_30[last_30["platform"] == "google"]) > 0
+                    else 0.0,
+                    "meta": float(last_30[last_30["platform"] == "meta"]["spend"].sum() / 30)
+                    if len(last_30[last_30["platform"] == "meta"]) > 0
+                    else 0.0,
+                    "ms": float(last_30[last_30["platform"] == "microsoft"]["spend"].sum() / 30)
+                    if len(last_30[last_30["platform"] == "microsoft"]) > 0
+                    else 0.0,
+                }
 
-                        insight_text = response.choices[0].message.content
-                        st.markdown(
-                            f"""
+                this_daily = {
+                    "google": float(google_budget) / max(1, int(period_days)),
+                    "meta": float(meta_budget) / max(1, int(period_days)),
+                    "ms": float(ms_budget) / max(1, int(period_days)),
+                }
+
+                deltas = {}
+                for k in ["google", "meta", "ms"]:
+                    prior = prior_daily.get(k, 0.0)
+                    curr = this_daily.get(k, 0.0)
+                    if prior and prior > 0:
+                        delta_pct = (curr - prior) / prior * 100.0
+                        deltas[f"spend_{k}"] = {"delta_pct": float(delta_pct)}
+                    else:
+                        deltas[f"spend_{k}"] = {"delta_pct": 0.0}
+
+                with st.spinner("Generating grounded causal attribution + risk flags..."):
+                    causal = generate_causal_outputs(
+                        period_days=period_days,
+                        pred_row=pred.to_dict() if hasattr(pred, "to_dict") else dict(pred),
+                        model=model,
+                        anomaly_results=anomaly_results,
+                        period_over_period_deltas=deltas,
+                        ood_flags=ood_flags,
+                    )
+
+                bullets = causal.get("causal_attribution_bullets", []) or []
+                risk_flags = causal.get("risk_flags", []) or []
+
+                st.markdown(
+                    f"""
 <div class="insight-box">
-  {insight_text}
+  <h4>Why the model expects this move</h4>
+  <ul>
+    {''.join([f"<li>{b}</li>" for b in bullets])}
+  </ul>
+  <hr/>
+  <h4>Operational risk flags</h4>
+  <ul>
+    {''.join([f"<li><b>{r.get('severity','')}&nbsp;</b> {r.get('risk','')} — {r.get('evidence','')}</li>" for r in risk_flags])}
+  </ul>
 </div>
 """,
-                            unsafe_allow_html=True,
-                        )
-                    except Exception as e:
-                        st.warning(f"AI insights unavailable: {e}")
-            else:
-                st.info("Install `groq` package and set GROQ_API_KEY in .env for AI insights")
+                    unsafe_allow_html=True,
+                )
+            except Exception as e:
+                logger.warning("Causal insights unavailable", exc_info=True)
+                st.warning("AI insights are temporarily unavailable — showing forecast without causal explanation.")
 
     else:
         st.markdown(
@@ -548,34 +722,41 @@ Forecast Results:
             unsafe_allow_html=True,
         )
 
-        st.markdown("---")
-        st.markdown("### Historical Data Overview")
-        try:
-            df = load_data_cached()
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Total Rows", f"{len(df):,}")
-            with col2:
-                st.metric("Campaigns", df["campaign_id"].nunique())
-            with col3:
-                start_date = df["date"].min().date()
-                end_date = df["date"].max().date()
-                st.write(f"**Date Range:** {start_date} - {end_date}")
-            with col4:
-                st.metric("Platforms", len(df["platform"].unique()))
+        # When forecast is not running yet, skip forecast-only sections.
+        st.stop()
 
-            daily_platform = df.groupby(["date", "platform"])["revenue"].sum().reset_index()
-            daily_pivot = daily_platform.pivot(index="date", columns="platform", values="revenue").fillna(0)
+    st.markdown("---")
+    st.markdown("### Historical Data Overview")
 
-            fig_trend = px.area(
-                daily_pivot,
-                title="Daily Revenue by Platform",
-                labels={"value": "Revenue ($)", "date": "Date"},
-                color_discrete_map={"google": "#4285F4", "meta": "#1877F2", "microsoft": "#00A4EF"},
-            )
-            st.plotly_chart(style_chart(fig_trend), width='stretch')
-        except Exception as e:
-            st.warning(f"Data preview unavailable: {e}")
+    try:
+        df = load_data_cached()
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Rows", f"{len(df):,}")
+        with col2:
+            st.metric("Campaigns", df["campaign_id"].nunique())
+        with col3:
+            start_date = df["date"].min().date()
+            end_date = df["date"].max().date()
+            st.write(f"**Date Range:** {start_date} - {end_date}")
+        with col4:
+            st.metric("Platforms", len(df["platform"].unique()))
+
+        daily_platform = df.groupby(["date", "platform"])["revenue"].sum().reset_index()
+        daily_pivot = daily_platform.pivot(
+            index="date", columns="platform", values="revenue"
+        ).fillna(0)
+
+        fig_trend = px.area(
+            daily_pivot,
+            title="Daily Revenue by Platform",
+            labels={"value": "Revenue ($)", "date": "Date"},
+            color_discrete_map={"google": "#4285F4", "meta": "#1877F2", "microsoft": "#00A4EF"},
+        )
+        st.plotly_chart(style_chart(fig_trend), width="stretch")
+    except Exception as e:
+        logger.warning("Data preview unavailable", exc_info=True)
+        st.warning("Historical data preview is temporarily unavailable — check the Data Explorer tab for details.")
 
 
 # ============================================================
@@ -636,8 +817,58 @@ with tab2:
             roas = filtered["revenue"].sum() / filtered["spend"].sum() if filtered["spend"].sum() > 0 else 0
             st.metric("Overall ROAS", f"{roas:.2f}x")
 
-        # Meta (and some other CSVs) may not have a usable revenue value column.
-        # Loader normalizes the metric as `conversions` (plural).
+        # ============================================================
+        # Data Quality / Campaign Consistency (explicit ingestion step)
+        # ============================================================
+        st.markdown("---")
+        st.markdown("## Data Quality")
+
+        qc = None
+        try:
+            qc = campaign_consistency_report_cached()
+        except Exception as e:
+            logger.warning("Campaign consistency validation unavailable", exc_info=True)
+            st.warning("Data quality report is temporarily unavailable — the data may still be valid.")
+
+        if isinstance(qc, dict) and "summary" in qc:
+            s = qc["summary"] or {}
+            passed = bool(s.get("passed", False))
+
+            status_color = "green" if passed else "red"
+            st.markdown(
+                f"""
+<div class="metric-card">
+  <h4>Campaign Consistency: <span style="color:{status_color}">{'PASS' if passed else 'FAIL'}</span></h4>
+  <p><b>Missing campaign_id rows:</b> {s.get('missing_campaign_id_rows', 0):,}</p>
+  <p><b>Missing campaign_type rows:</b> {s.get('missing_campaign_type_rows', 0):,}</p>
+  <p><b>Inconsistent name groups:</b> {s.get('inconsistent_name_groups', 0):,}</p>
+  <p><b>Inconsistent type groups:</b> {s.get('inconsistent_type_groups', 0):,}</p>
+  <p><b>Platform reassignment campaign IDs:</b> {s.get('platform_reassignment_campaign_ids', 0):,}</p>
+  <p><b>Campaigns with date gaps:</b> {s.get('campaigns_with_date_gaps', 0):,}</p>
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+
+            with st.expander("Details & examples (from validation checks)"):
+                checks = qc.get("checks", {}) if isinstance(qc.get("checks", {}), dict) else {}
+                if not checks:
+                    st.info("No check details available.")
+                else:
+                    # Render top examples for each check
+                    for check_name, check_result in checks.items():
+                        passed_flag = bool(check_result.get("passed", False))
+                        icon = "[PASS]" if passed_flag else "[WARN]"
+                        st.markdown(f"### {icon} {check_name}")
+                        st.write(check_result.get("details", ""))
+                        examples = check_result.get("examples", []) or []
+                        if examples:
+                            st.json(examples[:10])
+                        else:
+                            st.caption("No examples")
+        else:
+            st.info("Run-time report not available yet.")
+
         revenue_total = float(filtered["revenue"].sum()) if "revenue" in filtered.columns else 0.0
 
         if revenue_total > 0 and "revenue" in filtered.columns:
@@ -645,7 +876,6 @@ with tab2:
         elif "conversions" in filtered.columns:
             y_col = "conversions"
         else:
-            # Defensive fallback: pick whichever exists among known target columns, else error.
             candidate_cols = [c for c in ["revenue", "conversions"] if c in filtered.columns]
             if not candidate_cols:
                 raise KeyError("Neither 'revenue' nor 'conversions' columns exist in the loaded data.")
@@ -688,7 +918,8 @@ with tab2:
             width='stretch',
         )
     except Exception as e:
-        st.error(f"Error loading data: {e}")
+        logger.warning("Error loading data in Data Explorer tab", exc_info=True)
+        st.error("Unable to load campaign data — check that the data files are present in the `./data` directory.")
 
 
 # ============================================================
@@ -780,7 +1011,8 @@ with tab3:
             st.success("No data gaps detected")
 
     except Exception as e:
-        st.error(f"Error in anomaly detection: {e}")
+        logger.warning("Error in anomaly detection", exc_info=True)
+        st.error("Anomaly detection is temporarily unavailable — underlying data may be incomplete.")
 
 
 # ============================================================
@@ -804,11 +1036,107 @@ with tab4:
   <p>LightGBM quantile regression trained for P10/P50/P90 targets to produce probabilistic intervals.</p>
 
   <h4>4. Interval Calibration</h4>
-  <p>Conformal-style calibration adjusts interval width for better coverage.</p>
+  <p>Empirical bootstrap reconciliation is used to ensure additive coherence: blended total quantiles are derived from the same joint bootstrap draws as the channel-level quantiles, so P50 = google_P50 + meta_P50 + ms_P50 by construction.</p>
+
+  <h4>5. OOD Detection</h4>
+  <p>Per-channel out-of-distribution detection compares requested daily spend against historical 5th-95th percentiles. Channel cards flagged with "[!] Low confidence" indicate extrapolation risk.</p>
 </div>
 """,
         unsafe_allow_html=True,
     )
+
+    st.markdown("---")
+    st.markdown("### Calibration & Backtesting Results")
+
+    try:
+        val_results = get_validation_results_cached()
+        if isinstance(val_results, dict) and "error" not in val_results:
+            # Coverage comparison
+            rec_cal = val_results.get("8_reconciliation_calibration", {})
+            if isinstance(rec_cal, dict) and "results" in rec_cal:
+                r_res = rec_cal["results"]
+                cov = r_res.get("coverage", {})
+                pb = r_res.get("pinball_loss", {})
+                n_samp = r_res.get("n_samples", {})
+
+                col_c1, col_c2 = st.columns(2)
+                with col_c1:
+                    st.markdown("#### Empirical P10–P90 Coverage")
+                    legacy_cov = cov.get("legacy_p10_p90", float('nan'))
+                    recon_cov = cov.get("reconciled_p10_p90", float('nan'))
+                    st.metric("Legacy (independent heads)", f"{legacy_cov:.1%}" if not np.isnan(legacy_cov) else "N/A")
+                    st.metric("Reconciled (bootstrap)", f"{recon_cov:.1%}" if not np.isnan(recon_cov) else "N/A",
+                              delta=f"{recon_cov - legacy_cov:+.1%}" if not (np.isnan(recon_cov) or np.isnan(legacy_cov)) else None)
+                    st.caption(f"Samples: {n_samp.get('legacy', 0)} legacy, {n_samp.get('reconciled', 0)} reconciled")
+
+                with col_c2:
+                    st.markdown("#### Pinball Loss (lower is better)")
+                    leg_pb = pb.get("legacy", {})
+                    rec_pb = pb.get("reconciled", {})
+                    for q_label in ["p10", "p50", "p90"]:
+                        lv = leg_pb.get(q_label, float('nan'))
+                        rv = rec_pb.get(q_label, float('nan'))
+                        better = rv < lv if not (np.isnan(rv) or np.isnan(lv)) else None
+                        delta_str = f"{rv - lv:+.4f}" if not (np.isnan(rv) or np.isnan(lv)) else None
+                        st.metric(
+                            f"{q_label.upper()}",
+                            f"{rv:.4f}" if not np.isnan(rv) else "N/A",
+                            delta=delta_str,
+                            delta_color="normal" if better else "inverse",
+                        )
+
+                st.markdown("---")
+
+            # Model robustness (backtesting error)
+            rob = val_results.get("2_model_robustness", {})
+            if isinstance(rob, dict):
+                st.markdown("#### Backtesting (Rolling-Origin)")
+                st.metric("Samples Tested", rob.get("samples", 0))
+                st.metric("Median Error", f"{rob.get('median_error_pct', 0):.1f}%" if not np.isnan(rob.get('median_error_pct', float('nan'))) else "N/A")
+                st.metric("Within 50% Accuracy", f"{rob.get('within_50pct_accuracy', 0):.1f}%")
+
+            st.markdown("---")
+
+            # Budget sensitivity checks
+            bs = val_results.get("3_budget_sensitivity", {})
+            if isinstance(bs, dict) and "checks" in bs:
+                ch = bs["checks"]
+                st.markdown("#### Budget Sensitivity Checks")
+                for cname, cresult in ch.items():
+                    icon = "[PASS]" if cresult.get("passed") else "[WARN]"
+                    st.write(f"{icon} **{cname}**: {cresult.get('details', '')}")
+
+            st.markdown("---")
+
+            ec = val_results.get("5_edge_cases", {})
+            if isinstance(ec, dict) and "checks" in ec:
+                st.markdown("#### Edge Case Handling")
+                for cname, cresult in ec["checks"].items():
+                    icon = "[PASS]" if cresult.get("passed") else "[WARN]"
+                    st.write(f"{icon} **{cname}**: {cresult.get('details', '')}")
+
+            st.markdown("---")
+
+            # Baseline comparison
+            bs_metrics = val_results.get("2_model_robustness", {})
+            if bs_metrics.get("median_error_pct", 0) and not np.isnan(bs_metrics.get("median_error_pct", float('nan'))):
+                st.markdown("#### Baseline Model Comparison")
+                st.markdown(
+                    "The LightGBM quantile model is compared against a linear regression baseline during training. "
+                    "The LightGBM model captures non-linear channel interactions and saturation effects that the linear model cannot represent. "
+                    f"Backtesting median error: {bs_metrics.get('median_error_pct', 0):.1f}%."
+                )
+        else:
+            err_msg = str(val_results.get('error', ''))
+            if 'not trained' in err_msg.lower():
+                st.info("Validation results require a trained model — run `python src/train.py` first.")
+            else:
+                logger.warning(f"Validation results unavailable: {err_msg}")
+                st.info("Calibration and backtesting results will appear here once the validation suite completes.")
+
+    except Exception as e:
+        logger.warning("Backtesting results not available", exc_info=True)
+        st.info("Calibration data will appear here once the model is trained and validated — no action needed.")
 
     st.markdown("---")
     st.markdown("### Feature Importance")
@@ -836,3 +1164,42 @@ with tab4:
     else:
         st.info("Train the model first to see feature importances")
 
+    st.markdown("---")
+    st.markdown("### Reconciliation Methodology")
+
+    st.markdown(
+        """
+<div class="metric-card">
+  <h4>Bootstrap Reconciliation</h4>
+  <p>Channel-level and blended-total revenue quantiles are derived from the same set of joint bootstrap residual draws:</p>
+  <ol>
+    <li>Compute q50 (median) predictions for each channel's revenue model from the feature window.</li>
+    <li>Generate residuals = actual - predicted q50 from historical training periods with matching period length.</li>
+    <li>Draw N=300 bootstrap indices (shared across all three channels).</li>
+    <li>Build bootstrapped revenue draws: <code>boot_g = g_q50 + g_resid[i]</code> (and similarly for meta, ms).</li>
+    <li>Compute blended total as <code>boot_total = boot_g + boot_m + boot_ms</code>.</li>
+    <li>Take P10/P50/P90 of each distribution → additive by construction.</li>
+  </ol>
+  <p>This avoids the additive inconsistency that occurs when summing independently-trained quantile models.</p>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("---")
+    st.markdown("### OOD Detection Method")
+
+    st.markdown(
+        """
+<div class="metric-card">
+  <h4>Out-of-Distribution Detection</h4>
+  <p>For each forecast channel, the requested daily spend is compared against the historical daily spend distribution:</p>
+  <ul>
+    <li><b>Flagged</b> if daily spend is below the 5th percentile or above the 95th percentile.</li>
+    <li>A warning badge appears next to the channel name in the Forecast tab.</li>
+    <li>OOD flags are passed into the causal layer as an explicit signal for the explanation engine.</li>
+  </ul>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
