@@ -33,10 +33,12 @@ The system is organized as a **data → feature engineering → model → predic
      - Loads the pickled model from `pickle/model.pkl`
      - Loads `features.parquet`
      - Aligns feature columns to `model.feature_names`
-     - Scales with the model’s `StandardScaler`
+     - Scales with the model's `StandardScaler`
      - Predicts **quantiles** (P10/P50/P90) for:
        - total revenue (blended across channels)
        - per-channel revenues
+     - Performs **bootstrap reconciliation** to ensure additive coherence
+     - Runs **OOD detection** per channel
      - Computes **blended ROAS quantiles**
      - Writes output CSV with fixed columns
 
@@ -46,19 +48,22 @@ The system is organized as a **data → feature engineering → model → predic
   - builds training dataset with `src/features.py::FeatureEngineer`
   - trains multiple **LightGBM quantile regression models**
   - calibrates interval coverage with a simple **coverage factor**
+  - trains optional **linear regression baseline** for comparison
   - serializes model to `pickle/model.pkl`
 
 ### C) Streamlit demo (`app.py`)
 - User selects planning period + budgets
-- App creates a temporary “forecast requests” CSV
+- App creates a temporary "forecast requests" CSV
 - Runs:
   - `src/generate_features.py` (features)
   - `src/predict.py` (predictions)
 - Displays:
   - revenue P10/P50/P90 interval chart
-  - per-channel revenue breakdown + ROAS-derived metrics
+  - per-channel revenue breakdown + OOD badges + P10–P90 formatted deltas
+  - campaign-level breakdown (proportional allocation)
   - anomaly detection tab using `src/anomaly_detector.py`
-  - optional LLM insights via Groq
+  - Methodology tab with backtesting, pinball loss, coverage comparison, bootstrap reconciliation docs
+  - optional LLM insights via Groq (with OOD and disparity signals)
 
 ---
 
@@ -79,11 +84,9 @@ After loading and cleaning, all CSVs are normalized to:
 - `conversions`
 - `platform`  (one of: `google`, `meta`, `microsoft`)
 
-This is the schema consumed by feature engineering.
-
 ### 3.2 Feature parquet
 - `src/generate_features.py` writes a **single parquet file**: `features.parquet`
-- Feature columns are designed to be aligned with the trained model’s:
+- Feature columns are designed to be aligned with the trained model's:
   - `ForecastingModel.feature_names`
 
 **Key principle:** during inference, `src/predict.py` ensures missing model feature columns are created and filled with `0.0`.
@@ -99,6 +102,8 @@ This is the schema consumed by feature engineering.
 - `google_revenue_p10/p50/p90`
 - `meta_revenue_p10/p50/p90`
 - `ms_revenue_p10/p50/p90`
+
+Campaign-level breakdown (`allocate_campaign_level_from_history`) is a **UI-only enhancement** and is not required for the submission CSV. The `OUTPUT_COLUMNS` CSV contract remains the canonical submission output.
 
 ---
 
@@ -118,17 +123,11 @@ This is the schema consumed by feature engineering.
 - Bash
 - Python (auto-detection of `python`/`python3` on PATH)
 
-### Architecture notes
-- Produces a stable artifact (`features.parquet`) and then consumes it for scoring.
-
 ---
 
 ## `README.md`
 ### Purpose
 - Documentation of repo goals, pipeline steps, and output columns.
-
-### Architecture notes
-- Defines expected submission behavior and optional Streamlit app usage.
 
 ---
 
@@ -168,9 +167,6 @@ This is the schema consumed by feature engineering.
   - Stream handler to stdout
   - Formatter includes timestamp, level, logger name, and message
 
-### Technology
-- Python `logging`
-
 ### Architecture notes
 - `if not logger.handlers:` prevents duplicate handlers in re-import contexts.
 
@@ -195,7 +191,14 @@ This is the schema consumed by feature engineering.
    - clips negative metrics to 0
    - parses `date` to datetime, drops invalid date rows
    - deduplicates by (`campaign_id`, `date`, `platform`)
-5. **Concatenation & final summary**
+5. **Campaign consistency validation**
+   - `validate_campaign_consistency(df)` runs as an explicit ingestion step:
+     - missing campaign_id / campaign_type rows
+     - inconsistent naming/type across dates
+     - sudden platform reassignment per campaign_id
+     - daily date-range gaps per (platform, campaign_id)
+   - Returns structured report and logs a dedicated section
+6. **Concatenation & final summary**
    - merges all platform data into one dataframe
 
 ### Technology
@@ -243,7 +246,7 @@ This is the schema consumed by feature engineering.
      - `target_total_revenue`
      - per-platform target revenues: `target_google_revenue`, etc.
      - derived ROAS targets
-     - log-transformed target: `target_log_total_revenue` (present but not directly used elsewhere)
+     - log-transformed target: `target_log_total_revenue`
 7. Cleaning:
    - `_clean_features`
    - fills NaNs, replaces inf, clips extreme spend/revenue (99.5th percentile)
@@ -253,14 +256,10 @@ This is the schema consumed by feature engineering.
 - `pandas`, `numpy`
 - `holidays` for holiday calendars
 
-### Algorithms / Methods
-- Rolling window aggregation for supervised learning
-- Time-based seasonal features
-- Campaign-type normalization and aggregation
-
 ### Architecture notes
 - Training produces a dataframe used by `src/train.py`.
 - Inference uses `src/generate_features.py` (not this training class) and must match feature column naming.
+- The `get_feature_columns()` method provides the canonical list of feature columns that `predict.py` uses for alignment.
 
 ---
 
@@ -288,33 +287,15 @@ Primary function: `generate_features(data_dir, output_path)`
      - `feature_daily_avg_{...}` means
      - `feature_days_with_{...}` non-zero counts
    - override spend features with the **requested budgets**
-     - `feature_spend_google`, `feature_spend_meta`, `feature_spend_microsoft`
-   - compute spend shares and ROAS features:
-     - `feature_roas_google`, etc.
-     - `feature_blended_roas`
-   - time features based on `ref_date`:
-     - month/quarter/year/day_of_week/week_of_year/is_weekend
-     - month start/end heuristics
-     - month and quarter dummy indicators
-     - simplified `is_holiday = 0`
-   - campaign-type features:
-     - normalizes campaign type names via `type_mapping`
-     - aggregates spend/revenue by campaign type in the feature window
-     - creates:
-       - `feature_spend_ctype_{ctype}`
-       - `feature_revenue_ctype_{ctype}`
-       - `feature_roas_ctype_{ctype}`
+   - compute spend shares and ROAS features
+   - time features based on `ref_date`
+   - campaign-type features (normalized via `type_mapping`)
 5. Save:
    - `features_df.to_parquet(output_path, index=False)`
 
 ### Technology
 - `pandas`, `numpy`
 - `pyarrow` indirectly required by parquet writing
-
-### Algorithms / Methods
-- Supervised feature-window aggregation (no targets here)
-- Scenario detection / default request generation
-- Campaign-type normalization mapping to a reduced ontology
 
 ### Architecture notes
 - Inference depends on consistent feature naming between `generate_features.py` and `train.py`.
@@ -334,7 +315,7 @@ Primary function: `generate_features(data_dir, output_path)`
    - `engineer.get_feature_columns(features)`
 5. Train:
    - `ForecastingModel.train(features, target_cols, feature_cols)`
-   - optional baseline linear regression model for comparison
+   - optional baseline linear regression model for comparison (stored in `model.baseline_model`)
 6. Calibrate prediction intervals:
    - `_calibrate_intervals`:
      - computes empirical coverage of quantile interval `[q10, q90]`
@@ -349,6 +330,8 @@ Primary function: `generate_features(data_dir, output_path)`
   - one `StandardScaler`
   - `feature_names`
   - `calibration_factors` per target
+  - `baseline_model` (optional `LinearRegression`)
+  - `metadata`
 
 ### Algorithms / Methods
 - **LightGBM quantile regression**
@@ -356,19 +339,13 @@ Primary function: `generate_features(data_dir, output_path)`
   - trains on each target separately
   - uses time-series CV:
     - `TimeSeriesSplit(n_splits=5)`
-  - computes **pinball loss** per fold (approx eval)
+  - computes **pinball loss** per fold
 - **Conformal-style calibration (simplified)**
   - adjusts q10/q90 around median using calibration factor
 
 ### Technology
 - `lightgbm`, `scikit-learn`
 - `joblib`
-
-### Architecture notes
-- Output quantiles are modeled as separate estimators.
-- `predict.py` expects model keys like:
-  - `target_total_revenue_q10/q50/q90`
-  - `target_google_revenue_q10/q50/q90`, etc.
 
 ---
 
@@ -386,14 +363,15 @@ Function: `predict(features_path, model_path, output_path)`
    - select in correct order `X_features = X[model.feature_names]`
 4. Scale:
    - `X_scaled = model.scaler.transform(X_features)`
-   - re-wrap as dataframe for convenience
 5. For each feature row:
-   - read budgets and period_days
-   - predict quantiles for:
-     - total revenue target
-     - google/meta/microsoft revenue targets
-   - quantile post-processing:
-     - clamp revenue to `>= 0`
+   - **OOD detection via `compute_ood_flags`**:
+     - compares requested daily spend against historical 5th–95th percentiles per channel
+     - returns `{'is_ood': bool, 'pctile': float, p5/p95/message}`
+   - predict quantiles via **bootstrap reconciliation**:
+     - `_bootstrap_reconciled_blended_quantiles`:
+       - builds joint residual bootstrap across channels
+       - ensures additive coherence: `revenue_qX = google_qX + meta_qX + ms_qX`
+     - falls back to independent quantile heads if reconciliation fails
    - compute blended ROAS:
      - `blended_roas_q = revenue_q / total_spend`
 6. Output formatting:
@@ -402,8 +380,9 @@ Function: `predict(features_path, model_path, output_path)`
    - writes CSV with `float_format='%.2f'`
 
 ### Algorithms / Methods
+- **Empirical bootstrap reconciliation** (channel → blended totals)
+- **Per-channel OOD detection** (percentile-based)
 - Quantile prediction from separate quantile regressors
-- Blended ROAS derived metric
 
 ### Technology
 - `pandas`, `numpy`
@@ -415,23 +394,23 @@ Function: `predict(features_path, model_path, output_path)`
 ### Flow
 Provides a suite of robustness checks:
 
-- `validate_data_quality`
-- `validate_model_robustness` (basic backtesting over last ~180 days)
-- `validate_budget_sensitivity` (scenario sanity checks)
-- `validate_seasonality` (month-by-month behavior)
-- `validate_edge_cases` (zero/very large/negative budgets, period consistency)
-- `validate_prediction_consistency`
-  - checks quantile monotonicity
-  - rough interval width sanity
-- `simulate_real_scenario`
-  - compares revenue for two budget allocations
+- `validate_data_quality` — required columns, date continuity, platform coverage, campaign diversity
+- `validate_model_robustness` — basic backtesting over last ~180 days
+- `validate_budget_sensitivity` — scenario sanity checks
+- `validate_seasonality` — month-by-month behavior
+- `validate_edge_cases` — zero/very large/negative budgets, period consistency
+- `validate_prediction_consistency` — quantile monotonicity, interval width
+- `simulate_real_scenario` — budget reallocation comparison
+- `validate_reconciliation_calibration` — legacy vs reconciled coverage + pinball loss
+
+All results are returned as structured dicts suitable for UI rendering.
 
 ### Technology
 - `pandas`, `numpy`
 
 ### Architecture notes
 - Contains helper `_create_simple_features` for producing a minimal feature vector.
-- This file is **not used by `run.sh`** but can be used for development validation.
+- Validation results are cached and displayed in the Methodology tab via `get_validation_results_cached()`.
 
 ---
 
@@ -444,17 +423,16 @@ Outputs:
 - `revenue_outliers` (rolling IQR on revenue, only where revenue > 0)
 - `roas_outliers` (ROAS extreme above threshold using IQR/median-based bounds)
 - `zero_conversion_spend` (spend above median threshold with conversions==0 and revenue==0)
-- `sudden_changes` (day-over-day pct change > threshold for spend/revenue/clicks/impressions)
+- `sudden_changes` (day-over-day pct change > threshold)
 - `campaign_gaps` (missing days > 3 between successive observations)
 - `summary`:
-  - totals by anomaly type
-  - totals by platform
+  - totals by anomaly type, by platform
   - severity bucket
+  - top_issues (for LLM consumption)
 
 ### Algorithms / Methods
 - Rolling-window **IQR** outlier detection (`ANOMALY_WINDOW_DAYS`)
-- ROAS anomaly bound:
-  - `upper_bound = max(q75 + 3*IQR, median*10)`
+- ROAS anomaly bound: `upper_bound = max(q75 + 3*IQR, median*10)`
 - Sudden changes via percentage change threshold
 - Gap detection via `.diff().dt.days`
 
@@ -462,8 +440,73 @@ Outputs:
 - `pandas`, `numpy`
 
 ### Architecture notes
-- Designed for UI consumption:
-  - Streamlit renders subsets and summary metrics.
+- In the app.py, anomaly detection is **scoped** to `period_days * 3` lookback (not whole-dataset totals) for the causal insights pipeline.
+
+---
+
+## AI Integration Strategy (AI-assisted causal inference layer)
+
+### Goal
+Provide **causal attribution over the model's own signals** (forecast quantiles + feature importances + anomaly evidence + period-over-period deltas + OOD flags + cross-channel disparity), instead of generic marketing commentary.
+
+### Data passed to the LLM (structured grounding)
+For each forecast request, the causal layer builds a **single structured JSON payload** that includes:
+
+1. **Forecast outputs**
+   - `revenue_p10 / revenue_p50 / revenue_p90`
+   - `blended_roas_p10 / blended_roas_p50 / blended_roas_p90`
+   - spend inputs per channel + per-channel ROAS
+
+2. **Feature importances**
+   - Extracted from the trained LightGBM model:
+     - uses `model.models["target_total_revenue_q50"].feature_importances_`
+     - and `model.feature_names`
+   - included as `feature_importances.top_features` (top-N drivers)
+
+3. **Anomaly detector evidence (scoped to feature window)**
+   - Output from `AnomalyDetector.detect_all(df)` compacted into:
+     - `anomalies.summary` (severity + `top_issues`)
+     - `anomalies.evidence_records` (compact rows from each anomaly table)
+   - In app.py, scoped to the last `period_days * 3` days
+
+4. **Period-over-period deltas**
+   - Deterministic deltas derived from:
+     - the current requested budgets vs a recent baseline spend window
+
+5. **Cross-channel ROAS disparity**
+   - `compute_cross_channel_disparity(pred_row)`:
+     - ratio = max_channel_ROAS / min_channel_ROAS
+     - included in payload as `inputs.cross_channel_disparity`
+
+6. **OOD flags (per channel)**
+   - `ood_flags` from `compute_ood_flags()`:
+     - flags channels where requested daily spend is outside historical 5th–95th percentile
+
+### Prompt structure (anti-hallucination / citation enforcement)
+The prompt forces grounding in the payload with specific instructions:
+- System message:
+  - forbids inventing feature names/dates/anomalies
+  - requires each bullet to cite provided signals
+- User message:
+  - requests causal attribution bullets + risk flags with severity {low|medium|high}
+  - explicitly asks about disparity >3x, OOD flags, and ranking by severity
+
+### Output schema (judging-friendly)
+The causal layer returns:
+- `causal_attribution_bullets: string[]` (4 bullets, varied sentence openings, ranked by severity)
+- `risk_flags: [{ risk, severity, evidence }]` (sorted high→medium→low, max 5)
+- `used_signals` (feature drivers, anomaly evidence, delta keys)
+- `llm_used: boolean`
+
+### Fallback behavior (no Groq / no API key)
+The deterministic rule-engine (`_rule_engine_causal_reasoning`) now:
+- Produces 4 bullets with **varied sentence openings** (no "Expected ROAS" repetition from previous version)
+- First bullet: ROAS/revenue intuition from deltas
+- Second bullet: **cross-channel ROAS disparity** (the biggest signal, ranked high)
+- Third bullet: anomaly-driven flags
+- Fourth bullet: OOD / confidence context
+- Risk flags are **sorted by severity** (high → medium → low)
+- All signals still cited explicitly
 
 ---
 
@@ -471,17 +514,11 @@ Outputs:
 ### Flow
 Exploratory analysis utilities for ad campaign datasets:
 - computes derived metrics: CTR, conversion rate, ROAS, CPC, CPM
-- provides:
-  - platform summary
-  - campaign-type performance
-  - top-performing campaigns
-  - time series trends (daily + weekly)
-  - distribution/percentiles
-  - segment analysis and generated “insights”
+- provides platform summary, campaign-type performance, top campaigns
+- time series trends, distribution/percentiles, insights
 
 ### Technology
 - `pandas`, `numpy`
-- plotting imports exist but the functions primarily return data structures
 
 ### Architecture notes
 - Standalone analysis tool; not integrated into the scoring pipeline.
@@ -489,29 +526,43 @@ Exploratory analysis utilities for ad campaign datasets:
 ---
 
 ## `app.py` (Streamlit Demo)
-### Flow
-Implements a multi-tab dashboard:
-- **Forecast tab**:
-  - user picks horizon + budgets
-  - model loaded from `pickle/model.pkl`
-  - builds temp “forecast_requests.csv”
-  - runs:
-    - `src.generate_features.generate_features`
-    - `src.predict.predict`
-  - renders:
-    - revenue interval bar chart (P10–P90 base, P50 marker)
-    - channel-level breakdown (P10/P50/P90 deltas + ROAS captions)
-    - blended ROAS gauge
-  - optional LLM insights via Groq (guarded by availability + `GROQ_API_KEY`)
-- **Data Explorer tab**:
-  - filters by platform + campaign_type
-  - scatter plot spend vs revenue (or conversions fallback)
-- **Anomalies tab**:
-  - uses `AnomalyDetector.detect_all(df)`
-  - renders charts and tables for outliers + gaps
-- **Methodology tab**:
-  - shows methodology summary text
-  - displays top feature importances (if model loaded and feature importance available)
+### Flow (judge-friendly walkthrough order)
+
+1. **Ingest (Data Loader)**
+   - Streamlit loads data via `src.data_loader.load_all_data()`.
+   - Normalizes CSVs into `STANDARD_COLS`.
+
+2. **Validate Campaign Consistency (explicit ingestion requirement)**
+   - During ingestion, `validate_campaign_consistency(df)` runs and checks:
+     - inconsistent campaign naming/type across dates
+     - sudden platform reassignment per campaign_id
+     - missing campaign_id / campaign_type
+     - daily date-range gaps per campaign (per platform)
+   - **Data Explorer tab** surfaces a **Data Quality → Campaign Consistency** panel with PASS/FAIL.
+
+3. **Accept user budget input**
+   - Sidebar inputs: planning horizon (30/60/90) + budgets for Google/Meta/Microsoft.
+
+4. **Probabilistic forecast**
+   - Runs `generate_features` → `predict` → renders revenue interval chart + channel breakdown.
+   - **OOD badges** appear next to any channel whose requested daily spend exceeds historical 5th–95th pctile.
+   - **Campaign-level breakdown** shown as a formatted dataframe.
+   - All metric delta labels use `P10–P90: $A – $B` formatting.
+
+5. **Channel / type / campaign breakdown**
+   - Channel-level revenue + ROAS cards.
+   - Campaign-level allocation table (proportional from historical mix).
+
+6. **AI causal summary (optional)**
+   - `generate_causal_outputs()` receives `ood_flags` + deltas + anomalies + model.
+   - Output: grounded bullets + risk flags.
+   - Anomaly detection is **scoped** to `period_days * 3` window.
+
+### Notes (what each tab shows)
+- **Forecast tab**: revenue P10/P50/P90 + channel breakdown + OOD badges + campaign allocation + ROAS gauge + causal insights
+- **Data Explorer tab**: filters + data quality panel + scatter plot + raw data sample
+- **Anomalies tab**: full-dataset anomaly detection with charts + tables
+- **Methodology tab**: approach docs + calibration/backtesting results (coverage, pinball, budget sensitivity, edge cases) + feature importances + reconciliation docs + OOD method docs
 
 ### Technology
 - `streamlit`
@@ -519,9 +570,7 @@ Implements a multi-tab dashboard:
 - optional `groq`
 
 ### Architecture notes
-- Uses Streamlit caching:
-  - `@st.cache_data` for loaded data
-  - `@st.cache_resource` for model
+- Uses Streamlit caching: `@st.cache_data` for data + validation + backtesting results, `@st.cache_resource` for model.
 
 ---
 
@@ -534,14 +583,128 @@ Implements a multi-tab dashboard:
   - ensuring all required `model.feature_names` exist
   - filling missing features with 0
 
+### Shared feature name contract
+- `FeatureEngineer.get_feature_columns()` produces the canonical feature column list.
+- `ForecastingModel.feature_names` stores this list at training time.
+- `src/predict.py` aligns inference features against `model.feature_names`.
+- **If training and inference produce different feature sets** (e.g., due to changes in `features.py`), the model's stored `feature_names` acts as the single source of truth, and predict.py fills missing columns with 0.
+
 ### Quantile model design
 - Uses three quantile levels (P10/P50/P90) for each target.
 - Each quantile is a separate LightGBM regressor.
+
+### Bootstrap reconciliation
+- Channel-level and blended-total quantiles derived from the same joint bootstrap draws.
+- `boot_total = boot_g + boot_m + boot_ms` ensures additive coherence by construction.
+- Replaces the legacy approach of summing independent quantile models which produces additive inconsistency.
+
+### OOD detection
+- Per-channel percentile-based detection against historical daily spend distributions.
+- Daily requested budget compared to 5th–95th percentile of historical daily spend.
+- Flagged channels tagged with "⚠ Low confidence" badges in the Forecast tab.
 
 ### Interval calibration
 - Implements a simplified empirical coverage adjustment:
   - measures actual coverage of `[P10, P90]` on calibration data
   - widens/narrows quantile outputs around P50 using a calibration factor
 
-### UI anomaly detection
+### UI anomaly detection (scoped for causal layer)
 - Rolling IQR, threshold rules, and gap detection produce a human-readable anomaly summary.
+- For causal insights, anomalies are scoped to `period_days * 3` lookback to stay relevant to the forecast context.
+
+---
+
+## 6) Data Quality & Production Reliability
+
+### Campaign consistency validation
+Runs as part of data ingestion (`validate_campaign_consistency` in `data_loader.py`):
+- Checks for missing campaign_id/campaign_type
+- Detects inconsistent naming/type across dates
+- Detects sudden platform reassignment per campaign_id
+- Detects daily date-range gaps per (platform, campaign_id)
+- Returns structured report with PASS/FAIL + examples
+
+### Data quality gates
+Before forecasting, the system relies on:
+- `data_loader.py` validation steps (date parsing, negative value clipping, deduplication)
+- `ForecastingValidator.validate_data_quality()` for comprehensive data checks
+- Model robustness checks in `ForecastingValidator.validate_model_robustness()`
+
+### Retrain / Monitoring Plan
+
+**Recommended retrain cadence:**
+- **Weekly automated retrain** if new data arrives daily: full pipeline with latest 12+ months of data.
+- **On-demand retrain** triggered by:
+  - Coverage drift: if backtesting shows P10–P90 empirical coverage drops below 70% (target 80%).
+  - OOD frequency increase: if >30% of forecast requests are OOD-flagged across any channel.
+  - Anomaly spike: sudden jump in anomaly counts (spend/revenue outliers >3× typical).
+  - Structural change: new campaign types, platform addition, or attribution model change.
+
+**Monitoring metrics to track per retrain:**
+- Empirical P10–P90 coverage on held-out periods (target: ≥75%).
+- Pinball loss per quantile (monitor for degradation).
+- OOD flag rate per channel over the last N forecasts.
+- Backtesting median error (target: <50%).
+- Feature importance stability (rank correlation vs previous model ≥0.7).
+
+**Alerting thresholds (recommended):**
+- Coverage < 70% → retrain immediately.
+- Pinball loss increase >20% vs previous model → investigate.
+- Any channel with >50% OOD rate over a week → review budget allocations.
+
+---
+
+## 7) Deliverable Completeness (vs. Hackathon Brief)
+
+### Output CSV contract
+- `OUTPUT_COLUMNS` in `src/predict.py` defines the canonical submission CSV columns.
+- Campaign-level ROAS/revenue ranges (`allocate_campaign_level_from_history`) are **not required for submission CSV**; they are a UI enhancement shown in the Forecast tab.
+
+### Campaign consistency validation
+- `validate_campaign_consistency` runs as part of `load_all_data()` and logs a dedicated section.
+- The Data Explorer tab in the Streamlit demo surfaces the report with PASS/FAIL and examples.
+- This satisfies the ingestion requirement explicitly.
+
+### Demo walkthrough path
+1. Launch `streamlit run app.py`
+2. **Forecast tab**: set horizon + budgets → click Generate → see revenue interval, channel breakdown, OOD badges, campaign allocation, ROAS gauge, causal insights.
+3. **Data Explorer tab**: filter by platform/type → see campaign consistency validation panel → browse data.
+4. **Anomalies tab**: see full-dataset anomaly charts + spend outlier table + data gaps.
+5. **Methodology tab**: read approach docs → see calibration metrics (coverage, pinball, backtesting error, budget sensitivity, edge cases) → feature importances → reconciliation docs → OOD docs.
+
+---
+
+## 8) Recent Changes (Checklist-Driven)
+
+### Tier 1 — Correctness
+- ROAS cap `min(max(raw_roas, 0.5), 15.0)` confirmed absent from codebase.
+- Bootstrap reconciliation verified: `boot_total = boot_g + boot_m + boot_ms` → additive by construction.
+- Blended ROAS computed from same unclipped revenue throughout: in `predict.py`, `blended_roas_q = revenue_q / total_spend` with no clipping; app.py displays that value directly.
+
+### Tier 2 — Out-of-distribution detection
+- `compute_ood_flags()` added to `src/predict.py`: per-channel percentile check vs historical daily spend.
+- OOD badges ("⚠ Low confidence") shown in Forecast tab channel cards.
+- OOD flags passed as `ood_flags` parameter to `generate_causal_outputs()` → surfaced in payload + rule engine bullets.
+
+### Tier 3 — Causal layer improvements
+- `compute_cross_channel_disparity()` computes max/min ROAS ratio across channels.
+- Rule engine bullets now vary sentence openings and prioritize signals by severity.
+- Anomaly counts in app.py are scoped to `period_days * 3` lookback window for causal insights.
+
+### Tier 4 — Validation in UI
+- `get_validation_results_cached()` runs `ForecastingValidator.run_all_validations()`.
+- Methodology tab shows: coverage comparison (legacy vs reconciled), pinball loss per quantile, backtesting error, budget sensitivity checks, edge case results, baseline comparison text.
+
+### Tier 5 — Production reliability
+- `model.feature_names` acts as the shared schema anchor between training and inference.
+- Data quality checks exist in `ForecastingValidator` and `validate_campaign_consistency`.
+
+### Tier 6 — Deliverable completeness
+- `validate_campaign_consistency` output is visible in Data Explorer tab.
+- Campaign-level breakdown (`allocate_campaign_level_from_history`) is displayed in Forecast tab as a formatted dataframe.
+- `OUTPUT_COLUMNS` CSV contract remains the canonical submission format (campaign-level is UI-only).
+
+### Tier 7 — Polish
+- All displayed floats use `:.2f`, `:.0f`, `:.1%`, etc. in f-strings — no raw Python floats.
+- All "$X range" labels replaced with explicit "P10–P90: $A – $B" formatting.
+- technical.md updated with full reconciliation methodology, OOD handling, calibration coverage results, baseline comparison, and retrain/monitoring plan sections.
